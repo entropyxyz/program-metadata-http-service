@@ -19,7 +19,6 @@ use temp_dir::TempDir;
 use thiserror::Error;
 use tokio::fs::{read_dir, File};
 use tokio::io::AsyncReadExt;
-// use tower_http::services::ServeFile;
 
 #[derive(Clone)]
 struct AppState {
@@ -29,7 +28,8 @@ struct AppState {
 #[tokio::main]
 async fn main() {
     let app = Router::new()
-        .route("/programs/:program_hash", get(get_program))
+        .route("/programs", get(list_programs))
+        .route("/program/:program_hash", get(get_program))
         .route("/build-tar", post(build_tar))
         .route("/build-git", post(build_git))
         .with_state(AppState {
@@ -41,6 +41,7 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Get metadata about a program with a given hash
 async fn get_program(State(state): State<AppState>, Path(program_hash): Path<String>) -> String {
     let hash = hex::decode(program_hash).unwrap();
     std::str::from_utf8(&state.db.get(hash).unwrap().unwrap())
@@ -48,6 +49,17 @@ async fn get_program(State(state): State<AppState>, Path(program_hash): Path<Str
         .to_string()
 }
 
+/// Get hashes of all programs in the db
+async fn list_programs(State(state): State<AppState>) -> String {
+    let mut hashes = Vec::new();
+    for res in state.db.iter() {
+        let (key, _value) = res.unwrap();
+        hashes.push(hex::encode(key));
+    }
+    serde_json::to_string(&hashes).unwrap()
+}
+
+/// Add a program given as a tar achive
 async fn build_tar(
     State(state): State<AppState>,
     input: Bytes,
@@ -55,12 +67,13 @@ async fn build_tar(
     let input = input.to_vec();
     let mut archive = Archive::new(&input[..]);
     let temp_dir = TempDir::new().unwrap();
-    archive.unpack(temp_dir.path())?; // TODO this should be a unique temporary dir
+    archive.unpack(temp_dir.path())?;
 
     set_current_dir(temp_dir.path())?;
     build(state).await
 }
 
+/// Add a program given as a location of a git repo
 async fn build_git(
     State(state): State<AppState>,
     git_url: String,
@@ -85,7 +98,18 @@ async fn build_git(
     build(state).await
 }
 
+/// Build a program, and save metadata under the hash of its binary
 async fn build(state: AppState) -> Result<(StatusCode, String), AppError> {
+    // Get metadata from Cargo.toml file
+    let metadata = MetadataCommand::new()
+        .manifest_path("./Cargo.toml")
+        .features(CargoOpt::AllFeatures)
+        .exec()
+        .unwrap();
+    let root_package_metadata = metadata.root_package().unwrap();
+
+    // Build the program
+    // TODO use docker with the image given in the Cargo.toml file
     let output = Command::new("cargo")
         .arg("component")
         .arg("build")
@@ -102,10 +126,9 @@ async fn build(state: AppState) -> Result<(StatusCode, String), AppError> {
         ));
     }
 
-    let binary_filename = get_binary_filename().await.unwrap();
-    println!("{:?}", binary_filename);
-
+    // Get the hash of the binary
     let hash = {
+        let binary_filename = get_binary_filename().await.unwrap();
         let mut file = File::open(binary_filename).await?;
         let mut contents = vec![];
         file.read_to_end(&mut contents).await?;
@@ -113,21 +136,14 @@ async fn build(state: AppState) -> Result<(StatusCode, String), AppError> {
         BlakeTwo256::hash(&contents)
     };
 
-    // Get metadata (name and description) from Cargo.toml file
-    let metadata = MetadataCommand::new()
-        .manifest_path("./Cargo.toml")
-        .features(CargoOpt::AllFeatures)
-        .exec()
-        .unwrap();
-    let root_package_metadata = metadata.root_package().unwrap();
+    // Write metadata to db
     let root_package_metadata_json = serde_json::to_string(&root_package_metadata).unwrap();
-
     state
         .db
         .insert(hash, root_package_metadata_json.as_bytes())
         .unwrap();
-    // TODO Output the binary
-    // TODO clean up (rm temp dir)
+
+    // TODO Make the binary itself available
     Ok((StatusCode::OK, format!("{:?}", hash)))
 }
 
@@ -146,7 +162,7 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Get the name of the first .wasm file we find
+/// Get the name of the first .wasm file we find in the target directory
 async fn get_binary_filename() -> Option<PathBuf> {
     let mut dir_contents = read_dir("target/wasm32-unknown-unknown/release")
         .await
