@@ -30,8 +30,8 @@ async fn main() {
     let app = Router::new()
         .route("/programs", get(list_programs))
         .route("/program/:program_hash", get(get_program))
-        .route("/build-git", post(build_git))
-        .route("/build-tar", post(build_tar))
+        .route("/add-program-git", post(add_program_git))
+        .route("/add-program-tar", post(add_program_tar))
         .with_state(AppState {
             db: sled::open("./db").unwrap(),
         });
@@ -61,7 +61,7 @@ async fn list_programs(State(state): State<AppState>) -> Result<String, AppError
 }
 
 /// Add a program given as a location of a git repo
-async fn build_git(
+async fn add_program_git(
     State(state): State<AppState>,
     git_url: String,
 ) -> Result<(StatusCode, String), AppError> {
@@ -82,11 +82,11 @@ async fn build_git(
     }
 
     set_current_dir(temp_dir.path())?;
-    build(state).await
+    add_program(state).await
 }
 
 /// Add a program given as a tar achive
-async fn build_tar(
+async fn add_program_tar(
     State(state): State<AppState>,
     input: Bytes,
 ) -> Result<(StatusCode, String), AppError> {
@@ -96,11 +96,11 @@ async fn build_tar(
     archive.unpack(temp_dir.path())?;
 
     set_current_dir(temp_dir.path())?;
-    build(state).await
+    add_program(state).await
 }
 
 /// Build a program, and save metadata under the hash of its binary
-async fn build(state: AppState) -> Result<(StatusCode, String), AppError> {
+async fn add_program(state: AppState) -> Result<(StatusCode, String), AppError> {
     // Get metadata from Cargo.toml file
     let metadata = MetadataCommand::new()
         .manifest_path("./Cargo.toml")

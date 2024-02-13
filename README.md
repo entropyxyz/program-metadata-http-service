@@ -22,7 +22,7 @@ There are two ways to add a program's metadata and get the hash of the compiled 
 Give the git repo location which is passed directly to `git clone`, like so:
 
 ```bash
-echo -n "https://github.com/ameba23/program-always-fails.git" | http post localhost:3000/build-git
+echo -n "https://github.com/ameba23/program-always-fails.git" | http post localhost:3000/add-program-git
 ```
 
 ### Adding a program's source code directly using `tar`.
@@ -31,7 +31,7 @@ You can pipe a program's source code to the service `tar`:
 
 ```bash
 cd some_example_program
-tar cvf - . | http post localhost:3000/build-tar
+tar cvf - . | http post localhost:3000/add-program-tar
 ```
 
 Be aware this may fail if you accidentally include the `./target` directory, and the http request becomes too big.
@@ -39,7 +39,7 @@ Be aware this may fail if you accidentally include the `./target` directory, and
 You can tell tar to exclude stuff like this:
 
 ```bash
-tar --exclude='./target' --exclude='./.git' -cvf - . | http post localhost:3000/build-tar
+tar --exclude='./target' --exclude='./.git' -cvf - . | http post localhost:3000/add-program-tar
 ```
 
 ## Getting program metadata
