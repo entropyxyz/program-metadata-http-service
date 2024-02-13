@@ -62,7 +62,7 @@ Example output:
 You can get JSON metadata about a particular program using the hex encoded hash of its binary:
 
 ```bash
-http localhost:3000/program/
+http localhost:3000/program/a947e55b58659b5abaed2c710b9a6741fc728c81fd5b44201953745372597be5
 ```
 
 Example output:
