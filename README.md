@@ -1,5 +1,10 @@
+# program-metadata-web-service
 
-HTTP service which hosts a database of program metadata of open source programs which can be verified that the source code corresponds to the on-chain binary.
+HTTP JSON API which hosts a database of program metadata of open source programs which can be verified that the source code corresponds to the on-chain binary.
+
+## Requirements:
+
+Docker is required in order to build programs deterministically and git is required to be able to clone program repos.
 
 ## Usage:
 
@@ -27,6 +32,14 @@ You can pipe a program's source code to the service `tar`:
 ```bash
 cd some_example_program
 tar cvf - . | http post localhost:3000/build-tar
+```
+
+Be aware this may fail if you accidentally include the `./target` directory, and the http request becomes too big.
+
+You can tell tar to exclude stuff like this:
+
+```bash
+tar --exclude='./target' --exclude='./.git' -cvf - . | http post localhost:3000/build-tar
 ```
 
 ## Getting program metadata
