@@ -108,14 +108,20 @@ async fn build(state: AppState) -> Result<(StatusCode, String), AppError> {
         .unwrap();
     let root_package_metadata = metadata.root_package().unwrap();
 
+    // Get the docker image name from Cargo.toml, if there is one
+    let docker_image_name = get_docker_image_name_from_metadata(&root_package_metadata.metadata);
+
     // Build the program
-    // TODO use docker with the image given in the Cargo.toml file
-    let output = Command::new("cargo")
-        .arg("component")
-        .arg("build")
-        .arg("--release")
-        .arg("--target")
-        .arg("wasm32-unknown-unknown")
+    let mut command = Command::new("docker");
+    command.arg("build");
+    if let Some(image_name) = docker_image_name {
+        command
+            .arg("--build-arg")
+            .arg(format!("IMAGE={}", image_name));
+    }
+    let output = command
+        .arg("--output=binary-dir")
+        .arg(".")
         .stderr(Stdio::inherit())
         .stdout(Stdio::inherit())
         .output()?;
@@ -164,13 +170,22 @@ impl IntoResponse for AppError {
 
 /// Get the name of the first .wasm file we find in the target directory
 async fn get_binary_filename() -> Option<PathBuf> {
-    let mut dir_contents = read_dir("target/wasm32-unknown-unknown/release")
-        .await
-        .unwrap();
+    let mut dir_contents = read_dir("binary-dir").await.unwrap();
     while let Some(entry) = dir_contents.next_entry().await.unwrap() {
         if let Some(extension) = entry.path().extension() {
             if extension.to_str() == Some("wasm") {
                 return Some(entry.path());
+            }
+        }
+    }
+    None
+}
+
+fn get_docker_image_name_from_metadata(metadata: &serde_json::value::Value) -> Option<String> {
+    if let serde_json::value::Value::Object(m) = metadata {
+        if let Some(serde_json::value::Value::Object(p)) = m.get("entropy-program") {
+            if let Some(serde_json::value::Value::String(image_name)) = p.get("docker-image") {
+                return Some(image_name.clone());
             }
         }
     }
