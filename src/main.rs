@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 use cargo_metadata::{CargoOpt, MetadataCommand};
+use http::Method;
 use sp_core::Hasher;
 use sp_runtime::traits::BlakeTwo256;
 use std::{
@@ -19,6 +20,7 @@ use temp_dir::TempDir;
 use thiserror::Error;
 use tokio::fs::{read_dir, File};
 use tokio::io::AsyncReadExt;
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 struct AppState {
@@ -27,6 +29,10 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_origin(Any);
+
     let app = Router::new()
         .route("/programs", get(list_programs))
         .route("/program/:program_hash", get(get_program))
@@ -34,7 +40,8 @@ async fn main() {
         .route("/add-program-tar", post(add_program_tar))
         .with_state(AppState {
             db: sled::open("./db").unwrap(),
-        });
+        })
+        .layer(cors);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("Listening on localhost:3000");
