@@ -4,12 +4,16 @@ HTTP JSON API which hosts a database of program metadata of open source programs
 
 ## Requirements:
 
-Docker is required in order to build programs deterministically and git is required to be able to clone program repos.
+Docker is required in order to build programs deterministically and git is required to be able to clone program repos. You also need the `cargo-metadata` binary. If you have rust installed this comes by default, so the simplest was to get it is to install rust.
 
 ## Usage:
 
 Start the http server with:
 `cargo run`
+
+This will start listening on port 3000. To use port 1234:
+
+`cargo run -- 1234`
 
 The following http usage examples use the http client [httpie](https://httpie.io).
 
