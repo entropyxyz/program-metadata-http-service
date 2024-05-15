@@ -29,6 +29,10 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    let port = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "3000".to_string());
+
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
         .allow_origin(Any);
@@ -42,9 +46,11 @@ async fn main() {
             db: sled::open("./db").unwrap(),
         })
         .layer(cors);
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("Listening on localhost:3000");
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    println!("Listening on {}", local_addr);
     axum::serve(listener, app).await.unwrap();
 }
 
