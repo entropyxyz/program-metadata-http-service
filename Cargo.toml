@@ -1,5 +1,5 @@
 [package]
-name = "program-metadata-web-service"
+name = "program-metadata-http-service"
 description = "An service which stores metadata about Entropy programs"
 version = "0.1.0"
 edition = "2021"

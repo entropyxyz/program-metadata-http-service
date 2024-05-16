@@ -1,4 +1,4 @@
-# program-metadata-web-service
+# program-metadata-http-service
 
 HTTP JSON API which hosts a database of program metadata of open source programs which can be verified that the source code corresponds to the on-chain binary.
 
