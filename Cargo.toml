@@ -3,17 +3,17 @@ name = "program-metadata-web-service"
 description = "An service which stores metadata about Entropy programs"
 version = "0.1.0"
 edition = "2021"
-authors   =['Entropy Cryptography <engineering@entropy.xyz>']
-homepage  ='https://entropy.xyz/'
-license   ='AGPL-3.0-or-later'
+authors = ['Entropy Cryptography <engineering@entropy.xyz>']
+homepage = 'https://entropy.xyz/'
+license = 'AGPL-3.0-or-later'
 
 [dependencies]
 axum = "0.7.4"
 tar = "0.4.40"
 thiserror = "1.0.56"
-tokio = { version="1.36.0", features=["rt-multi-thread"] }
-tower-http = { version="0.5.1", features=["fs", "cors"] }
-sp-runtime = { version="24.0.0", default-features=true }
+tokio = { version = "1.36.0", features = ["rt-multi-thread"] }
+tower-http = { version = "0.5.1", features = ["fs", "cors"] }
+sp-runtime = { version = "24.0.0", default-features = true }
 sp-core = "21.0.0"
 cargo_metadata = "0.18.1"
 sled = "0.34.7"
@@ -21,3 +21,5 @@ hex = "0.4.3"
 serde_json = "1.0.113"
 temp-dir = "0.1.12"
 http = "1.0.0"
+log = "0.4.21"
+env_logger = "0.11.3"

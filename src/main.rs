@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{self, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -11,8 +11,7 @@ use http::Method;
 use sp_core::Hasher;
 use sp_runtime::traits::BlakeTwo256;
 use std::{
-    env::set_current_dir,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 use tar::Archive;
@@ -29,6 +28,8 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
+
     let port = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "3000".to_string());
@@ -46,18 +47,20 @@ async fn main() {
             db: sled::open("./db").unwrap(),
         })
         .layer(cors);
+
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
         .unwrap();
     let local_addr = listener.local_addr().unwrap();
     println!("Listening on {}", local_addr);
+
     axum::serve(listener, app).await.unwrap();
 }
 
 /// Get metadata about a program with a given hash
 async fn get_program(
     State(state): State<AppState>,
-    Path(program_hash): Path<String>,
+    extract::Path(program_hash): extract::Path<String>,
 ) -> Result<String, AppError> {
     let hash = hex::decode(program_hash)?;
     Ok(std::str::from_utf8(&state.db.get(hash)?.ok_or(AppError::ProgramNotFound)?)?.to_string())
@@ -94,8 +97,7 @@ async fn add_program_git(
         ));
     }
 
-    set_current_dir(temp_dir.path())?;
-    add_program(state).await
+    add_program(state, temp_dir.path()).await
 }
 
 /// Add a program given as a tar achive
@@ -108,15 +110,16 @@ async fn add_program_tar(
     let temp_dir = TempDir::new()?;
     archive.unpack(temp_dir.path())?;
 
-    set_current_dir(temp_dir.path())?;
-    add_program(state).await
+    add_program(state, temp_dir.path()).await
 }
 
 /// Build a program, and save metadata under the hash of its binary
-async fn add_program(state: AppState) -> Result<(StatusCode, String), AppError> {
+async fn add_program(state: AppState, repo_path: &Path) -> Result<(StatusCode, String), AppError> {
+    let manifest_path: PathBuf = [repo_path, Path::new("Cargo.toml")].iter().collect();
+
     // Get metadata from Cargo.toml file
     let metadata = MetadataCommand::new()
-        .manifest_path("./Cargo.toml")
+        .manifest_path(manifest_path)
         .features(CargoOpt::AllFeatures)
         .exec()?;
 
@@ -127,6 +130,8 @@ async fn add_program(state: AppState) -> Result<(StatusCode, String), AppError> 
     // Get the docker image name from Cargo.toml, if there is one
     let docker_image_name = get_docker_image_name_from_metadata(&root_package_metadata.metadata);
 
+    let binary_dir: PathBuf = [repo_path, Path::new("binary_dir")].iter().collect();
+
     // Build the program
     let mut command = Command::new("docker");
     command.arg("build");
@@ -136,8 +141,8 @@ async fn add_program(state: AppState) -> Result<(StatusCode, String), AppError> 
             .arg(format!("IMAGE={}", image_name));
     }
     let output = command
-        .arg("--output=binary-dir")
-        .arg(".")
+        .arg(format!("--output={}", binary_dir.display()))
+        .arg(repo_path)
         .stderr(Stdio::inherit())
         .stdout(Stdio::inherit())
         .output()?;
@@ -150,13 +155,14 @@ async fn add_program(state: AppState) -> Result<(StatusCode, String), AppError> 
 
     // Get the hash of the binary
     let hash = {
-        let binary_filename = get_binary_filename().await?;
+        let binary_filename = get_binary_filename(binary_dir).await?;
         let mut file = File::open(binary_filename).await?;
         let mut contents = vec![];
         file.read_to_end(&mut contents).await?;
-        // TODO this wont let us hash chunks which means we need to read the whole binary into memory
+        // TODO #6 this wont let us hash chunks which means we need to read the whole binary into memory
         BlakeTwo256::hash(&contents)
     };
+    log::info!("Hashed binary {:?}", hash);
 
     // Write metadata to db
     let root_package_metadata_json = serde_json::to_string(&root_package_metadata)?;
@@ -164,13 +170,13 @@ async fn add_program(state: AppState) -> Result<(StatusCode, String), AppError> 
         .db
         .insert(hash, root_package_metadata_json.as_bytes())?;
 
-    // TODO Make the binary itself available
+    // TODO #7 Make the binary itself available
     Ok((StatusCode::OK, format!("{:?}", hash)))
 }
 
 /// Get the name of the first .wasm file we find in the target directory
-async fn get_binary_filename() -> Result<PathBuf, AppError> {
-    let mut dir_contents = read_dir("binary-dir").await?;
+async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, AppError> {
+    let mut dir_contents = read_dir(binary_dir).await.unwrap();
     while let Some(entry) = dir_contents.next_entry().await? {
         if let Some(extension) = entry.path().extension() {
             if extension.to_str() == Some("wasm") {
