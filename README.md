@@ -1,37 +1,28 @@
 # program-metadata-http-service
 
-HTTP JSON API which hosts a database of program metadata of open source programs which can be verified that the source code corresponds to the on-chain binary.
+HTTP JSON API which hosts a database of Entropy program metadata of open source programs which can be verified that the source code corresponds to the on-chain binary.
 
-## Requirements:
+This works by compiling the program in a docker container using a known image. Reliably, building the same version of the program with the same docker image will give the same binary hash. To add a program to the database, you give the URL of a git repository containing the program. The program gets compiled on the server side, and metadata from the program's `Cargo.toml` file gets stored under the binary hash. This hash can be used when specifying the program for an Entropy account.
 
-Docker is required in order to build programs deterministically and git is required to be able to clone program repos. You also need the `cargo-metadata` binary. If you have rust installed this comes by default, so the simplest was to get it is to install rust.
+## Usage
 
-## Usage:
-
-Start the http server with:
-`cargo run`
-
-This will start listening on port 3000. To use port 1234:
-
-`cargo run -- 1234`
-
-The following http usage examples use the http client [httpie](https://httpie.io).
-
-## Adding a program
+### Adding a program
 
 There are two ways to add a program's metadata and get the hash of the compiled program in the response.
 
-### Adding a program from a public git repo
+#### Adding a program from a public git repo
 
-Give the git repo location which is passed directly to `git clone`, like so:
+Give the git repository URL, which is passed directly to `git clone`, in a `POST` request to `/add-program-git`.
 
 ```bash
-echo -n "https://github.com/ameba23/program-always-fails.git" | http post localhost:3000/add-program-git
+echo -n "https://github.com/myusername/my-program.git" | http post localhost:3000/add-program-git
 ```
 
-### Adding a program's source code directly using `tar`.
+If the program successfully compiles, the binary hash will be given in the response. Bear in mind this can take a couple of minutes.
 
-You can pipe a program's source code to the service `tar`:
+#### Adding a program's source code directly using `tar`.
+
+You can pipe a program's source code to the service using `tar` and a `POST` request to `/add-program-tar`:
 
 ```bash
 cd some_example_program
@@ -46,15 +37,15 @@ You can tell tar to exclude stuff like this:
 tar --exclude='./target' --exclude='./.git' -cvf - . | http post localhost:3000/add-program-tar
 ```
 
-## Getting program metadata
+### Getting program metadata
 
-You can get a list of all program hashes as a JSON encoded array of hex strings:
+You can get a list of all program hashes as a JSON encoded array of hex strings by making a `GET` request to `/programs`:
 
 ```bash
 http localhost:3000/programs
 ```
 
-Example output:
+Example response:
 ```json 
 [
     "64871473c40795324d86d6cb0a42c0a2b546fefe02785d8f6f0124ac2b2200e9",
@@ -63,13 +54,13 @@ Example output:
 ]
 ```
 
-You can get JSON metadata about a particular program using the hex encoded hash of its binary:
+You can get JSON metadata about a particular program by making a `GET` request to `/program/` followed by the hex encoded hash of its binary:
 
 ```bash
 http localhost:3000/program/a947e55b58659b5abaed2c710b9a6741fc728c81fd5b44201953745372597be5
 ```
 
-Example output:
+Example reponse:
 ```json
 {
     "authors": [
@@ -138,3 +129,21 @@ Example output:
     "version": "0.1.0"
 }
 ```
+
+## Running the server
+
+### Requirements:
+
+Docker is required in order to build programs deterministically and git is required to be able to clone program repos. You also need the `cargo-metadata` binary. If you have rust installed this comes by default, so the simplest was to get it is to install rust.
+
+### Usage:
+
+Start the http server with:
+`cargo run`
+
+This will start listening on port 3000. To use port 1234:
+
+`cargo run -- 1234`
+
+The following http usage examples use the http client [httpie](https://httpie.io).
+
