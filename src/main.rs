@@ -1,12 +1,13 @@
+//! An http service which builds programs and hosts related metadata
 use axum::{
     body::Bytes,
     extract::{self, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Router,
 };
-use cargo_metadata::{CargoOpt, MetadataCommand};
+use cargo_metadata::{CargoOpt, MetadataCommand, Package};
 use http::Method;
 use sp_core::Hasher;
 use sp_runtime::traits::BlakeTwo256;
@@ -39,6 +40,7 @@ async fn main() {
         .allow_origin(Any);
 
     let app = Router::new()
+        .route("/", get(front_page))
         .route("/programs", get(list_programs))
         .route("/program/:program_hash", get(get_program))
         .route("/add-program-git", post(add_program_git))
@@ -204,6 +206,36 @@ fn get_docker_image_name_from_metadata(metadata: &serde_json::value::Value) -> O
         }
     }
     None
+}
+
+/// The "/" route responds with a web page showing the programs
+async fn front_page(State(state): State<AppState>) -> Html<String> {
+    let mut programs = Vec::new();
+    for res in state.db.iter() {
+        if let Ok((key, value)) = res {
+            if let Ok(package) = serde_json::from_slice::<Package>(&value) {
+                let hash = hex::encode(key);
+                programs.push(format!(
+                    "<li><a href=\"program/{}\">{} <code>{}</code></a></li>",
+                    hash, package.name, hash,
+                ));
+            }
+        }
+    }
+
+    Html(format!(
+        r#"
+        <!doctype html>
+        <html>
+            <head></head>
+            <body>
+                <h1>Program metadata http service</h1>
+                <ul>{}</ul>
+            </body>
+        </html>
+        "#,
+        programs.join("\n"),
+    ))
 }
 
 #[derive(Debug, Error)]
