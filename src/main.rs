@@ -21,12 +21,14 @@ use build::handle_build_requests;
 
 #[derive(Clone)]
 struct AppState {
+    /// The key value store
     db: sled::Db,
+    /// Channel for sending build requests
     build_requests_tx: Sender<BuildRequest>,
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let port = std::env::args()
@@ -39,7 +41,7 @@ async fn main() {
 
     let (build_requests_tx, build_requests_rx) = channel(1000);
 
-    let db = sled::open("./db").unwrap();
+    let db = sled::open("./db")?;
 
     let app = Router::new()
         .route("/", get(front_page))
@@ -53,10 +55,8 @@ async fn main() {
         })
         .layer(cors);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
-        .await
-        .unwrap();
-    let local_addr = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let local_addr = listener.local_addr()?;
     println!("Listening on {}", local_addr);
 
     // Handle requests to build programs in serial in a separate task
@@ -64,9 +64,11 @@ async fn main() {
         handle_build_requests(build_requests_rx, db).await;
     });
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
+/// A request to build a program
 enum BuildRequest {
     Git {
         url: String,
@@ -91,7 +93,7 @@ async fn add_program_git(
             response: tx,
         })
         .await?;
-    rx.await.unwrap()
+    rx.await?
 }
 
 /// Add a program given as a tar achive
@@ -107,7 +109,7 @@ async fn add_program_tar(
             response: tx,
         })
         .await?;
-    rx.await.unwrap()
+    rx.await?
 }
 
 /// Get metadata about a program with a given hash
@@ -182,7 +184,9 @@ enum AppError {
     #[error("Program not found")]
     ProgramNotFound,
     #[error("Queue is full: {0}")]
-    Mpsc(#[from] tokio::sync::mpsc::error::SendError<BuildRequest>),
+    MpscSend(#[from] tokio::sync::mpsc::error::SendError<BuildRequest>),
+    #[error("Response channel sender dropped: {0}")]
+    OneShotRecv(#[from] tokio::sync::oneshot::error::RecvError),
 }
 
 impl IntoResponse for AppError {

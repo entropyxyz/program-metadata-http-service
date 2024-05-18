@@ -131,7 +131,7 @@ impl ProgramBuilder {
 }
 /// Get the name of the first .wasm file we find in the target directory
 async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, AppError> {
-    let mut dir_contents = read_dir(binary_dir).await.unwrap();
+    let mut dir_contents = read_dir(binary_dir).await?;
     while let Some(entry) = dir_contents.next_entry().await? {
         if let Some(extension) = entry.path().extension() {
             if extension.to_str() == Some("wasm") {
