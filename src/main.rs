@@ -67,7 +67,7 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-pub enum BuildRequest {
+enum BuildRequest {
     Git {
         url: String,
         response: oneshot::Sender<Result<(StatusCode, String), AppError>>,
@@ -84,10 +84,13 @@ async fn add_program_git(
     git_url: String,
 ) -> Result<(StatusCode, String), AppError> {
     let (tx, rx) = oneshot::channel();
-    state.build_requests_tx.send(BuildRequest::Git {
-        url: git_url,
-        response: tx,
-    });
+    state
+        .build_requests_tx
+        .send(BuildRequest::Git {
+            url: git_url,
+            response: tx,
+        })
+        .await?;
     rx.await.unwrap()
 }
 
@@ -97,10 +100,13 @@ async fn add_program_tar(
     input: Bytes,
 ) -> Result<(StatusCode, String), AppError> {
     let (tx, rx) = oneshot::channel();
-    state.build_requests_tx.send(BuildRequest::Tar {
-        raw_archive: input.to_vec(),
-        response: tx,
-    });
+    state
+        .build_requests_tx
+        .send(BuildRequest::Tar {
+            raw_archive: input.to_vec(),
+            response: tx,
+        })
+        .await?;
     rx.await.unwrap()
 }
 
@@ -175,6 +181,8 @@ enum AppError {
     CompilationFailed(String),
     #[error("Program not found")]
     ProgramNotFound,
+    #[error("Queue is full: {0}")]
+    Mpsc(#[from] tokio::sync::mpsc::error::SendError<BuildRequest>),
 }
 
 impl IntoResponse for AppError {

@@ -19,14 +19,18 @@ pub async fn handle_build_requests(mut build_requests_rx: Receiver<BuildRequest>
         match build_request {
             BuildRequest::Git { url, response } => {
                 let result = program_builder.add_program_git(url).await;
-                response.send(result).unwrap();
+                if let Err(_) = response.send(result) {
+                    log::error!("Response channel has been dropped while building a program",);
+                }
             }
             BuildRequest::Tar {
                 raw_archive,
                 response,
             } => {
                 let result = program_builder.add_program_tar(raw_archive).await;
-                response.send(result).unwrap();
+                if let Err(_) = response.send(result) {
+                    log::error!("Response channel has been dropped while building a program",);
+                }
             }
         }
     }
