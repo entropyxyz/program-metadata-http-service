@@ -1,8 +1,10 @@
 use axum::http::StatusCode;
 use cargo_metadata::{CargoOpt, MetadataCommand};
+use futures::channel::mpsc::Sender;
 use sp_core::Hasher;
 use sp_runtime::traits::BlakeTwo256;
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -20,6 +22,12 @@ pub async fn handle_build_requests(mut build_requests_rx: Receiver<BuildRequest>
             BuildRequest::Git { url, response } => {
                 let result = program_builder.add_program_git(url).await;
                 if let Err(_) = response.send(result) {
+                    log::error!("Response channel has been dropped while building a program",);
+                }
+            }
+            BuildRequest::GitStructured { url, mut response } => {
+                let result = program_builder.add_program_git(url).await;
+                if let Err(_) = response.try_send(result.map(|(_a, b)| b)) {
                     log::error!("Response channel has been dropped while building a program",);
                 }
             }
@@ -57,7 +65,7 @@ impl ProgramBuilder {
             ));
         }
 
-        self.add_program(temp_dir.path()).await
+        self.add_program(temp_dir.path(), None).await
     }
 
     /// Add a program given as a tar achive
@@ -66,11 +74,15 @@ impl ProgramBuilder {
         let temp_dir = TempDir::new()?;
         archive.unpack(temp_dir.path())?;
 
-        self.add_program(temp_dir.path()).await
+        self.add_program(temp_dir.path(), None).await
     }
 
     /// Build a program, and save metadata under the hash of its binary
-    async fn add_program(&self, repo_path: &Path) -> Result<(StatusCode, String), AppError> {
+    async fn add_program(
+        &self,
+        repo_path: &Path,
+        response_tx: Option<Sender<String>>,
+    ) -> Result<(StatusCode, String), AppError> {
         let manifest_path: PathBuf = [repo_path, Path::new("Cargo.toml")].iter().collect();
 
         // Get metadata from Cargo.toml file
@@ -97,17 +109,41 @@ impl ProgramBuilder {
                 .arg("--build-arg")
                 .arg(format!("IMAGE={}", image_name));
         }
-        let output = command
+        let mut process = command
             .arg(format!("--output={}", binary_dir.display()))
             .arg(repo_path)
-            .stderr(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .output()?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // .stderr(Stdio::inherit())
+        // .stdout(Stdio::inherit())
+        // .output()?;
 
-        if !output.status.success() {
-            return Err(AppError::CompilationFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+        let mut stdout = process.stdout.take().unwrap();
+        let mut stderr = process.stderr.take().unwrap();
+        loop {
+            let mut buf: [u8; 10_000] = [0; 10_000];
+            let read_bytes_stdout = stdout.read(&mut buf)?;
+            if read_bytes_stdout > 0 {
+                println!(
+                    "read bytes out: {}",
+                    std::str::from_utf8(&buf[..read_bytes_stdout]).unwrap()
+                );
+            };
+
+            let read_bytes_stderr = stderr.read(&mut buf)?;
+            if read_bytes_stderr > 0 {
+                println!(
+                    "read bytes err: {}",
+                    std::str::from_utf8(&buf[..read_bytes_stderr]).unwrap()
+                );
+            };
+            if read_bytes_stderr == 0 && read_bytes_stdout == 0 {
+                break;
+            }
+        }
+        if !process.wait().unwrap().success() {
+            return Err(AppError::CompilationFailed("unknown".to_string()));
         }
 
         // Get the hash of the binary

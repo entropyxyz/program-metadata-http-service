@@ -1,6 +1,6 @@
 //! An http service which builds programs and hosts related metadata
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{self, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
@@ -8,6 +8,7 @@ use axum::{
     Router,
 };
 use cargo_metadata::Package;
+use futures::channel::mpsc as futures_mpsc;
 use http::Method;
 use thiserror::Error;
 use tokio::sync::{
@@ -49,6 +50,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/program/:program_hash", get(get_program))
         .route("/add-program-git", post(add_program_git))
         .route("/add-program-tar", post(add_program_tar))
+        .route(
+            "/add-program-git-structured",
+            post(add_program_git_structured),
+        )
         .with_state(AppState {
             db: db.clone(),
             build_requests_tx,
@@ -78,6 +83,26 @@ enum BuildRequest {
         raw_archive: Vec<u8>,
         response: oneshot::Sender<Result<(StatusCode, String), AppError>>,
     },
+    GitStructured {
+        url: String,
+        response: futures_mpsc::Sender<Result<String, AppError>>,
+    },
+}
+
+async fn add_program_git_structured(
+    State(state): State<AppState>,
+    git_url: String,
+) -> Result<(StatusCode, Body), AppError> {
+    let (response_tx, response_rx) = futures_mpsc::channel(1000);
+    state
+        .build_requests_tx
+        .send(BuildRequest::GitStructured {
+            url: git_url,
+            response: response_tx,
+        })
+        .await?;
+
+    Ok((StatusCode::OK, Body::from_stream(response_rx)))
 }
 
 /// Add a program from a git repository

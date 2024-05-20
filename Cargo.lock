@@ -1776,6 +1776,7 @@ dependencies = [
  "axum",
  "cargo_metadata",
  "env_logger",
+ "futures",
  "hex",
  "http",
  "log",
