@@ -7,28 +7,28 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use cargo_metadata::{CargoOpt, MetadataCommand, Package};
+use cargo_metadata::Package;
 use http::Method;
-use sp_core::Hasher;
-use sp_runtime::traits::BlakeTwo256;
-use std::{
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-};
-use tar::Archive;
-use temp_dir::TempDir;
 use thiserror::Error;
-use tokio::fs::{read_dir, File};
-use tokio::io::AsyncReadExt;
+use tokio::sync::{
+    mpsc::{channel, Sender},
+    oneshot,
+};
 use tower_http::cors::{Any, CorsLayer};
+
+mod build;
+use build::handle_build_requests;
 
 #[derive(Clone)]
 struct AppState {
+    /// The key value store
     db: sled::Db,
+    /// Channel for sending build requests
+    build_requests_tx: Sender<BuildRequest>,
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let port = std::env::args()
@@ -39,6 +39,10 @@ async fn main() {
         .allow_methods([Method::GET, Method::POST])
         .allow_origin(Any);
 
+    let (build_requests_tx, build_requests_rx) = channel(1000);
+
+    let db = sled::open("./db")?;
+
     let app = Router::new()
         .route("/", get(front_page))
         .route("/programs", get(list_programs))
@@ -46,17 +50,66 @@ async fn main() {
         .route("/add-program-git", post(add_program_git))
         .route("/add-program-tar", post(add_program_tar))
         .with_state(AppState {
-            db: sled::open("./db").unwrap(),
+            db: db.clone(),
+            build_requests_tx,
         })
         .layer(cors);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
-        .await
-        .unwrap();
-    let local_addr = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let local_addr = listener.local_addr()?;
     println!("Listening on {}", local_addr);
 
-    axum::serve(listener, app).await.unwrap();
+    // Handle requests to build programs in serial in a separate task
+    tokio::spawn(async move {
+        handle_build_requests(build_requests_rx, db).await;
+    });
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// A request to build a program
+enum BuildRequest {
+    Git {
+        url: String,
+        response: oneshot::Sender<Result<(StatusCode, String), AppError>>,
+    },
+    Tar {
+        raw_archive: Vec<u8>,
+        response: oneshot::Sender<Result<(StatusCode, String), AppError>>,
+    },
+}
+
+/// Add a program from a git repository
+async fn add_program_git(
+    State(state): State<AppState>,
+    git_url: String,
+) -> Result<(StatusCode, String), AppError> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .build_requests_tx
+        .send(BuildRequest::Git {
+            url: git_url,
+            response: tx,
+        })
+        .await?;
+    rx.await?
+}
+
+/// Add a program given as a tar achive
+async fn add_program_tar(
+    State(state): State<AppState>,
+    input: Bytes,
+) -> Result<(StatusCode, String), AppError> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .build_requests_tx
+        .send(BuildRequest::Tar {
+            raw_archive: input.to_vec(),
+            response: tx,
+        })
+        .await?;
+    rx.await?
 }
 
 /// Get metadata about a program with a given hash
@@ -76,136 +129,6 @@ async fn list_programs(State(state): State<AppState>) -> Result<String, AppError
         hashes.push(hex::encode(key));
     }
     Ok(serde_json::to_string(&hashes)?)
-}
-
-/// Add a program given as a location of a git repo
-async fn add_program_git(
-    State(state): State<AppState>,
-    git_url: String,
-) -> Result<(StatusCode, String), AppError> {
-    let temp_dir = TempDir::new()?;
-    let output = Command::new("git")
-        .arg("clone")
-        .arg("--depth=1")
-        .arg(git_url)
-        .arg(temp_dir.path())
-        .stderr(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .output()?;
-
-    if !output.status.success() {
-        return Err(AppError::GitClone(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    add_program(state, temp_dir.path()).await
-}
-
-/// Add a program given as a tar achive
-async fn add_program_tar(
-    State(state): State<AppState>,
-    input: Bytes,
-) -> Result<(StatusCode, String), AppError> {
-    let input = input.to_vec();
-    let mut archive = Archive::new(&input[..]);
-    let temp_dir = TempDir::new()?;
-    archive.unpack(temp_dir.path())?;
-
-    add_program(state, temp_dir.path()).await
-}
-
-/// Build a program, and save metadata under the hash of its binary
-async fn add_program(state: AppState, repo_path: &Path) -> Result<(StatusCode, String), AppError> {
-    let manifest_path: PathBuf = [repo_path, Path::new("Cargo.toml")].iter().collect();
-
-    // Get metadata from Cargo.toml file
-    let metadata = MetadataCommand::new()
-        .manifest_path(manifest_path)
-        .features(CargoOpt::AllFeatures)
-        .exec()?;
-
-    let root_package_metadata = metadata
-        .root_package()
-        .ok_or(AppError::MetadataMissingRootPackage)?;
-
-    // Get the docker image name from Cargo.toml, if there is one
-    let docker_image_name = get_docker_image_name_from_metadata(&root_package_metadata.metadata);
-
-    let binary_dir: PathBuf = [repo_path, Path::new("binary_dir")].iter().collect();
-
-    // Build the program
-    let mut command = Command::new("docker");
-    command.arg("build");
-    if let Some(image_name) = docker_image_name {
-        command
-            .arg("--build-arg")
-            .arg(format!("IMAGE={}", image_name));
-    }
-    let output = command
-        .arg(format!("--output={}", binary_dir.display()))
-        .arg(repo_path)
-        .stderr(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .output()?;
-
-    if !output.status.success() {
-        return Err(AppError::CompilationFailed(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    // Get the hash of the binary
-    let hash = {
-        let binary_filename = get_binary_filename(binary_dir).await?;
-        let mut file = File::open(binary_filename).await?;
-        let mut contents = vec![];
-        file.read_to_end(&mut contents).await?;
-        // TODO #6 this wont let us hash chunks which means we need to read the whole binary into memory
-        BlakeTwo256::hash(&contents)
-    };
-    log::info!("Hashed binary {:?}", hash);
-
-    // Write metadata to db
-    let root_package_metadata_json = serde_json::to_string(&root_package_metadata)?;
-    state
-        .db
-        .insert(hash, root_package_metadata_json.as_bytes())?;
-
-    // TODO #7 Make the binary itself available
-    Ok((StatusCode::OK, format!("{:?}", hash)))
-}
-
-/// Get the name of the first .wasm file we find in the target directory
-async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, AppError> {
-    let mut dir_contents = read_dir(binary_dir).await.unwrap();
-    while let Some(entry) = dir_contents.next_entry().await? {
-        if let Some(extension) = entry.path().extension() {
-            if extension.to_str() == Some("wasm") {
-                return Ok(entry.path());
-            }
-        }
-    }
-    Err(AppError::CompilationFailed(
-        "Cannot find binary after compiling".to_string(),
-    ))
-}
-
-/// We expect there to be a docker image given in the Cargo.toml file like so:
-/// ```toml
-/// [package.metadata.entropy-program]
-/// docker-image = "peg997/build-entropy-programs:version0.1"
-/// ```
-/// If this is not present a default image is used
-fn get_docker_image_name_from_metadata(metadata: &serde_json::value::Value) -> Option<String> {
-    if let serde_json::value::Value::Object(m) = metadata {
-        if let Some(serde_json::value::Value::Object(p)) = m.get("entropy-program") {
-            if let Some(serde_json::value::Value::String(image_name)) = p.get("docker-image") {
-                return Some(image_name.clone());
-            }
-        }
-    }
-    None
 }
 
 /// The "/" route responds with a web page showing the programs
@@ -260,6 +183,10 @@ enum AppError {
     CompilationFailed(String),
     #[error("Program not found")]
     ProgramNotFound,
+    #[error("Queue is full: {0}")]
+    MpscSend(#[from] tokio::sync::mpsc::error::SendError<BuildRequest>),
+    #[error("Response channel sender dropped: {0}")]
+    OneShotRecv(#[from] tokio::sync::oneshot::error::RecvError),
 }
 
 impl IntoResponse for AppError {
