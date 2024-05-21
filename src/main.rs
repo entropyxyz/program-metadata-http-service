@@ -14,8 +14,7 @@ use thiserror::Error;
 use tokio::sync::mpsc::{channel, Sender};
 use tower_http::cors::{Any, CorsLayer};
 
-mod build;
-use build::{handle_build_requests, BuildRequest, BuildResponder};
+use program_metadata_http_service::build::{handle_build_requests, BuildRequest, BuildResponder};
 
 #[derive(Clone)]
 struct AppState {
@@ -146,13 +145,7 @@ async fn front_page(State(state): State<AppState>) -> Html<String> {
 }
 
 #[derive(Debug, Error)]
-enum AppError {
-    #[error("Could not clone git repository: {0}")]
-    GitClone(String),
-    #[error("Cannot find root package in Cargo.toml")]
-    MetadataMissingRootPackage,
-    #[error("Error reading Cargo.toml: {0}")]
-    Metadata(#[from] cargo_metadata::Error),
+pub enum AppError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Utf8Error: {0}")]
@@ -161,16 +154,10 @@ enum AppError {
     Db(#[from] sled::Error),
     #[error("Cannot decode hex {0}")]
     Hex(#[from] hex::FromHexError),
-    #[error("Io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Compilation failed: {0}")]
-    CompilationFailed(String),
     #[error("Program not found")]
     ProgramNotFound,
     #[error("Queue is full: {0}")]
     MpscSend(#[from] tokio::sync::mpsc::error::SendError<BuildRequest>),
-    #[error("Response channel sender dropped: {0}")]
-    OneShotRecv(#[from] tokio::sync::oneshot::error::RecvError),
 }
 
 impl IntoResponse for AppError {

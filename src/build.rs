@@ -11,10 +11,9 @@ use std::{
 };
 use tar::Archive;
 use temp_dir::TempDir;
+use thiserror::Error;
 use tokio::fs::{read_dir, File};
 use tokio::{io::AsyncReadExt, sync::mpsc::Receiver};
-
-use crate::AppError;
 
 /// A request to build a program
 pub struct BuildRequest {
@@ -63,18 +62,18 @@ pub enum BuildResponse {
 
 /// For serializing and sending [BuildResponse]s to the client
 #[derive(Debug, Clone)]
-pub struct BuildResponder(pub futures_mpsc::Sender<Result<String, AppError>>);
+pub struct BuildResponder(pub futures_mpsc::Sender<Result<String, Error>>);
 
 impl BuildResponder {
     fn try_send(
         &mut self,
         build_response: BuildResponse,
-    ) -> Result<(), TrySendError<Result<String, AppError>>> {
+    ) -> Result<(), TrySendError<Result<String, Error>>> {
         self.0
-            .try_send(serde_json::to_string(&build_response).map_err(|e| AppError::Json(e)))
+            .try_send(serde_json::to_string(&build_response).map_err(|e| Error::Json(e)))
     }
 
-    fn try_send_error(&mut self, error: AppError) {
+    fn try_send_error(&mut self, error: Error) {
         if self.0.try_send(Err(error)).is_err() {
             log::error!("Client dropped connection while attempting to send error reponse");
         }
@@ -114,7 +113,7 @@ impl ProgramBuilder {
         &self,
         git_url: String,
         response_tx: BuildResponder,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), Error> {
         let temp_dir = TempDir::new()?;
         let output = Command::new("git")
             .arg("clone")
@@ -126,7 +125,7 @@ impl ProgramBuilder {
             .output()?;
 
         if !output.status.success() {
-            return Err(AppError::GitClone(
+            return Err(Error::GitClone(
                 String::from_utf8_lossy(&output.stderr).to_string(),
             ));
         }
@@ -139,7 +138,7 @@ impl ProgramBuilder {
         &self,
         input: Vec<u8>,
         response_tx: BuildResponder,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), Error> {
         let mut archive = Archive::new(&input[..]);
         let temp_dir = TempDir::new()?;
         archive.unpack(temp_dir.path())?;
@@ -152,7 +151,7 @@ impl ProgramBuilder {
         &self,
         repo_path: &Path,
         mut response_tx: BuildResponder,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), Error> {
         let manifest_path: PathBuf = [repo_path, Path::new("Cargo.toml")].iter().collect();
 
         // Get metadata from Cargo.toml file
@@ -163,7 +162,7 @@ impl ProgramBuilder {
 
         let root_package_metadata = metadata
             .root_package()
-            .ok_or(AppError::MetadataMissingRootPackage)?;
+            .ok_or(Error::MetadataMissingRootPackage)?;
 
         // Get the docker image name from Cargo.toml, if there is one
         let docker_image_name =
@@ -229,7 +228,7 @@ impl ProgramBuilder {
             }
         }
         if !process.wait().unwrap().success() {
-            return Err(AppError::CompilationFailed("unknown".to_string()));
+            return Err(Error::CompilationFailed("unknown".to_string()));
         }
 
         let binary_filename = get_binary_filename(binary_dir).await?;
@@ -269,7 +268,7 @@ impl ProgramBuilder {
     }
 }
 /// Get the name of the first .wasm file we find in the target directory
-async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, AppError> {
+async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, Error> {
     let mut dir_contents = read_dir(binary_dir).await?;
     while let Some(entry) = dir_contents.next_entry().await? {
         if let Some(extension) = entry.path().extension() {
@@ -278,7 +277,7 @@ async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, AppError> {
             }
         }
     }
-    Err(AppError::CompilationFailed(
+    Err(Error::CompilationFailed(
         "Cannot find binary after compiling".to_string(),
     ))
 }
@@ -298,4 +297,25 @@ fn get_docker_image_name_from_metadata(metadata: &serde_json::value::Value) -> O
         }
     }
     None
+}
+
+/// An error when trying to build a program
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Could not clone git repository: {0}")]
+    GitClone(String),
+    #[error("Cannot find root package in Cargo.toml")]
+    MetadataMissingRootPackage,
+    #[error("Error reading Cargo.toml: {0}")]
+    Metadata(#[from] cargo_metadata::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Database error {0}")]
+    Db(#[from] sled::Error),
+    #[error("Cannot decode hex {0}")]
+    Hex(#[from] hex::FromHexError),
+    #[error("Io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Compilation failed: {0}")]
+    CompilationFailed(String),
 }
