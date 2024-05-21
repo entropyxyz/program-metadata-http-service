@@ -184,12 +184,9 @@ impl ProgramBuilder {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        // .stderr(Stdio::inherit())
-        // .stdout(Stdio::inherit())
-        // .output()?;
 
-        let mut stdout = process.stdout.take().unwrap();
-        let mut stderr = process.stderr.take().unwrap();
+        let mut stdout = process.stdout.take().ok_or(Error::NoStdOut)?;
+        let mut stderr = process.stderr.take().ok_or(Error::NoStdErr)?;
         loop {
             let mut buf: [u8; 10_000] = [0; 10_000];
             let read_bytes_stdout = stdout.read(&mut buf)?;
@@ -227,8 +224,8 @@ impl ProgramBuilder {
                 break;
             }
         }
-        if !process.wait().unwrap().success() {
-            return Err(Error::CompilationFailed("unknown".to_string()));
+        if !process.wait()?.success() {
+            return Err(Error::CompilationFailed("Unknown".to_string()));
         }
 
         let binary_filename = get_binary_filename(binary_dir).await?;
@@ -262,8 +259,7 @@ impl ProgramBuilder {
                 binary,
                 binary_filename: binary_filename_string,
             })
-            .unwrap();
-        // TODO #7 Make the binary itself available
+            .map_err(|_| Error::Mpsc)?;
         Ok(())
     }
 }
@@ -318,4 +314,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("Compilation failed: {0}")]
     CompilationFailed(String),
+    #[error("Failed to get standard output of child process")]
+    NoStdOut,
+    #[error("Failed to get standard error of child process")]
+    NoStdErr,
+    #[error("Could not send response - client disconnected")]
+    Mpsc,
 }
