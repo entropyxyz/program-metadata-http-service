@@ -23,6 +23,7 @@ pub struct BuildRequest {
 }
 
 impl BuildRequest {
+    /// A new build request with a git url
     pub fn new_git(url: String, responder: BuildResponder) -> Self {
         Self {
             request_type: BuildRequestType::Git { url },
@@ -30,6 +31,7 @@ impl BuildRequest {
         }
     }
 
+    /// A new build request with the contents of a tar archive
     pub fn new_tar(raw_archive: Vec<u8>, responder: BuildResponder) -> Self {
         Self {
             request_type: BuildRequestType::Tar { raw_archive },
@@ -38,6 +40,7 @@ impl BuildRequest {
     }
 }
 
+/// Input parameters for a build request
 pub enum BuildRequestType {
     Git { url: String },
     Tar { raw_archive: Vec<u8> },
@@ -46,11 +49,19 @@ pub enum BuildRequestType {
 /// An item in the response stream for a program being built
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BuildResponse {
+    /// A message from building on standard output
     StdOut(String),
+    /// A message from building on standard error
     StdErr(String),
-    Success { hash: H256, binary: Vec<u8> },
+    /// The final message on a successful build, with the hash and binary blob
+    Success {
+        hash: H256,
+        binary: Vec<u8>,
+        binary_filename: String,
+    },
 }
 
+/// For serializing and sending [BuildResponse]s to the client
 #[derive(Debug, Clone)]
 pub struct BuildResponder(pub futures_mpsc::Sender<Result<String, AppError>>);
 
@@ -221,15 +232,25 @@ impl ProgramBuilder {
             return Err(AppError::CompilationFailed("unknown".to_string()));
         }
 
-        // Get the hash of the binary
-        let (hash, binary) = {
-            let binary_filename = get_binary_filename(binary_dir).await?;
+        let binary_filename = get_binary_filename(binary_dir).await?;
+
+        let binary_filename_string = binary_filename
+            .file_name()
+            .and_then(|o| o.to_str())
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "program.wasm".to_string());
+
+        // Read the wasm binary
+        let binary = {
             let mut file = File::open(binary_filename).await?;
-            let mut contents = vec![];
-            file.read_to_end(&mut contents).await?;
-            // TODO #6 this wont let us hash chunks which means we need to read the whole binary into memory
-            (BlakeTwo256::hash(&contents), contents)
+            let mut binary = vec![];
+            file.read_to_end(&mut binary).await?;
+            binary
         };
+
+        // Hash the binary
+        // TODO #6 this wont let us hash chunks which means we need to read the whole binary into memory
+        let hash = BlakeTwo256::hash(&binary);
         log::info!("Hashed binary {:?}", hash);
 
         // Write metadata to db
@@ -237,7 +258,11 @@ impl ProgramBuilder {
         self.0.insert(hash, root_package_metadata_json.as_bytes())?;
 
         response_tx
-            .try_send(BuildResponse::Success { hash, binary })
+            .try_send(BuildResponse::Success {
+                hash,
+                binary,
+                binary_filename: binary_filename_string,
+            })
             .unwrap();
         // TODO #7 Make the binary itself available
         Ok(())
