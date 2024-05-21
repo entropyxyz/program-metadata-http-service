@@ -1,5 +1,8 @@
 use cargo_metadata::{CargoOpt, MetadataCommand};
+use futures::channel::mpsc::{self as futures_mpsc, TrySendError};
+use serde::{Deserialize, Serialize};
 use sp_core::Hasher;
+use sp_core::H256;
 use sp_runtime::traits::BlakeTwo256;
 use std::{
     io::Read,
@@ -11,26 +14,81 @@ use temp_dir::TempDir;
 use tokio::fs::{read_dir, File};
 use tokio::{io::AsyncReadExt, sync::mpsc::Receiver};
 
-use crate::{AppError, BuildRequest, BuildResponder, BuildResponse};
+use crate::AppError;
+
+/// A request to build a program
+pub struct BuildRequest {
+    request_type: BuildRequestType,
+    responder: BuildResponder,
+}
+
+impl BuildRequest {
+    pub fn new_git(url: String, responder: BuildResponder) -> Self {
+        Self {
+            request_type: BuildRequestType::Git { url },
+            responder,
+        }
+    }
+
+    pub fn new_tar(raw_archive: Vec<u8>, responder: BuildResponder) -> Self {
+        Self {
+            request_type: BuildRequestType::Tar { raw_archive },
+            responder,
+        }
+    }
+}
+
+pub enum BuildRequestType {
+    Git { url: String },
+    Tar { raw_archive: Vec<u8> },
+}
+
+/// An item in the response stream for a program being built
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BuildResponse {
+    StdOut(String),
+    StdErr(String),
+    Success { hash: H256, binary: Vec<u8> },
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildResponder(pub futures_mpsc::Sender<Result<String, AppError>>);
+
+impl BuildResponder {
+    fn try_send(
+        &mut self,
+        build_response: BuildResponse,
+    ) -> Result<(), TrySendError<Result<String, AppError>>> {
+        self.0
+            .try_send(serde_json::to_string(&build_response).map_err(|e| AppError::Json(e)))
+    }
+
+    fn try_send_error(&mut self, error: AppError) {
+        if self.0.try_send(Err(error)).is_err() {
+            log::error!("Client dropped connection while attempting to send error reponse");
+        }
+    }
+}
 
 pub async fn handle_build_requests(mut build_requests_rx: Receiver<BuildRequest>, db: sled::Db) {
     let program_builder = ProgramBuilder(db);
     while let Some(build_request) = build_requests_rx.recv().await {
-        match build_request {
-            BuildRequest::Git { url, mut response } => {
-                if let Err(error) = program_builder.add_program_git(url, response.clone()).await {
-                    response.try_send_error(error)
-                }
-            }
-            BuildRequest::Tar {
-                raw_archive,
-                mut response,
-            } => {
+        let mut responder = build_request.responder;
+        match build_request.request_type {
+            BuildRequestType::Git { url } => {
                 if let Err(error) = program_builder
-                    .add_program_tar(raw_archive, response.clone())
+                    .add_program_git(url, responder.clone())
                     .await
                 {
-                    response.try_send_error(error)
+                    responder.try_send_error(error)
+                }
+            }
+            BuildRequestType::Tar { raw_archive } => {
+                if let Err(error) = program_builder
+                    .add_program_tar(raw_archive, responder.clone())
+                    .await
+                {
+                    responder.try_send_error(error)
                 }
             }
         }

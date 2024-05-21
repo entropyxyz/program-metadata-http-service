@@ -8,16 +8,14 @@ use axum::{
     Router,
 };
 use cargo_metadata::Package;
-use futures::channel::mpsc::{self as futures_mpsc, TrySendError};
+use futures::channel::mpsc::{self as futures_mpsc};
 use http::Method;
-use serde::{Deserialize, Serialize};
-use sp_core::H256;
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, Sender};
 use tower_http::cors::{Any, CorsLayer};
 
 mod build;
-use build::handle_build_requests;
+use build::{handle_build_requests, BuildRequest, BuildResponder};
 
 #[derive(Clone)]
 struct AppState {
@@ -68,45 +66,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// A request to build a program
-enum BuildRequest {
-    Git {
-        url: String,
-        response: BuildResponder,
-    },
-    Tar {
-        raw_archive: Vec<u8>,
-        response: BuildResponder,
-    },
-}
-
-/// An item in the response stream for a program being built
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum BuildResponse {
-    StdOut(String),
-    StdErr(String),
-    Success { hash: H256, binary: Vec<u8> },
-}
-
-#[derive(Debug, Clone)]
-struct BuildResponder(futures_mpsc::Sender<Result<String, AppError>>);
-
-impl BuildResponder {
-    fn try_send(
-        &mut self,
-        build_response: BuildResponse,
-    ) -> Result<(), TrySendError<Result<String, AppError>>> {
-        self.0
-            .try_send(serde_json::to_string(&build_response).map_err(|e| AppError::Json(e)))
-    }
-
-    fn try_send_error(&mut self, error: AppError) {
-        if self.0.try_send(Err(error)).is_err() {
-            log::error!("Client dropped connection while attempting to send error reponse");
-        }
-    }
-}
-
 /// Add a program from a git repository
 async fn add_program_git(
     State(state): State<AppState>,
@@ -115,10 +74,7 @@ async fn add_program_git(
     let (response_tx, response_rx) = futures_mpsc::channel(1000);
     state
         .build_requests_tx
-        .send(BuildRequest::Git {
-            url: git_url,
-            response: BuildResponder(response_tx),
-        })
+        .send(BuildRequest::new_git(git_url, BuildResponder(response_tx)))
         .await?;
 
     Ok((StatusCode::OK, Body::from_stream(response_rx)))
@@ -132,10 +88,10 @@ async fn add_program_tar(
     let (response_tx, response_rx) = futures_mpsc::channel(1000);
     state
         .build_requests_tx
-        .send(BuildRequest::Tar {
-            raw_archive: input.to_vec(),
-            response: BuildResponder(response_tx),
-        })
+        .send(BuildRequest::new_tar(
+            input.to_vec(),
+            BuildResponder(response_tx),
+        ))
         .await?;
     Ok((StatusCode::OK, Body::from_stream(response_rx)))
 }
