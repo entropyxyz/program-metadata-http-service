@@ -18,7 +18,8 @@ Give the git repository URL, which is passed directly to `git clone`, in a `POST
 echo -n "https://github.com/myusername/my-program.git" | http post localhost:3000/add-program-git
 ```
 
-If the program successfully compiles, the binary hash will be given in the response. Bear in mind this can take a couple of minutes.
+The response contains a series of `BuildResponse` messages, with logging forwarded from the build.
+If the program successfully compiles, the final message will contain the wasm binary together with its hash which is how it will be referred to on-chain. Bear in mind this can take a couple of minutes.
 
 #### Adding a program's source code directly using `tar`.
 
