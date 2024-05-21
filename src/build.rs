@@ -1,6 +1,4 @@
-use axum::http::StatusCode;
 use cargo_metadata::{CargoOpt, MetadataCommand};
-use futures::channel::mpsc::Sender;
 use sp_core::Hasher;
 use sp_runtime::traits::BlakeTwo256;
 use std::{
@@ -13,31 +11,26 @@ use temp_dir::TempDir;
 use tokio::fs::{read_dir, File};
 use tokio::{io::AsyncReadExt, sync::mpsc::Receiver};
 
-use crate::{AppError, BuildRequest};
+use crate::{AppError, BuildRequest, BuildResponder, BuildResponse};
 
 pub async fn handle_build_requests(mut build_requests_rx: Receiver<BuildRequest>, db: sled::Db) {
     let program_builder = ProgramBuilder(db);
     while let Some(build_request) = build_requests_rx.recv().await {
         match build_request {
-            BuildRequest::Git { url, response } => {
-                let result = program_builder.add_program_git(url).await;
-                if let Err(_) = response.send(result) {
-                    log::error!("Response channel has been dropped while building a program",);
-                }
-            }
-            BuildRequest::GitStructured { url, mut response } => {
-                let result = program_builder.add_program_git(url).await;
-                if let Err(_) = response.try_send(result.map(|(_a, b)| b)) {
-                    log::error!("Response channel has been dropped while building a program",);
+            BuildRequest::Git { url, mut response } => {
+                if let Err(error) = program_builder.add_program_git(url, response.clone()).await {
+                    response.try_send_error(error)
                 }
             }
             BuildRequest::Tar {
                 raw_archive,
-                response,
+                mut response,
             } => {
-                let result = program_builder.add_program_tar(raw_archive).await;
-                if let Err(_) = response.send(result) {
-                    log::error!("Response channel has been dropped while building a program",);
+                if let Err(error) = program_builder
+                    .add_program_tar(raw_archive, response.clone())
+                    .await
+                {
+                    response.try_send_error(error)
                 }
             }
         }
@@ -48,7 +41,11 @@ struct ProgramBuilder(sled::Db);
 
 impl ProgramBuilder {
     /// Add a program given as a location of a git repo
-    pub async fn add_program_git(&self, git_url: String) -> Result<(StatusCode, String), AppError> {
+    pub async fn add_program_git(
+        &self,
+        git_url: String,
+        response_tx: BuildResponder,
+    ) -> Result<(), AppError> {
         let temp_dir = TempDir::new()?;
         let output = Command::new("git")
             .arg("clone")
@@ -65,24 +62,28 @@ impl ProgramBuilder {
             ));
         }
 
-        self.add_program(temp_dir.path(), None).await
+        self.add_program(temp_dir.path(), response_tx).await
     }
 
     /// Add a program given as a tar achive
-    async fn add_program_tar(&self, input: Vec<u8>) -> Result<(StatusCode, String), AppError> {
+    async fn add_program_tar(
+        &self,
+        input: Vec<u8>,
+        response_tx: BuildResponder,
+    ) -> Result<(), AppError> {
         let mut archive = Archive::new(&input[..]);
         let temp_dir = TempDir::new()?;
         archive.unpack(temp_dir.path())?;
 
-        self.add_program(temp_dir.path(), None).await
+        self.add_program(temp_dir.path(), response_tx).await
     }
 
     /// Build a program, and save metadata under the hash of its binary
     async fn add_program(
         &self,
         repo_path: &Path,
-        response_tx: Option<Sender<String>>,
-    ) -> Result<(StatusCode, String), AppError> {
+        mut response_tx: BuildResponder,
+    ) -> Result<(), AppError> {
         let manifest_path: PathBuf = [repo_path, Path::new("Cargo.toml")].iter().collect();
 
         // Get metadata from Cargo.toml file
@@ -125,18 +126,34 @@ impl ProgramBuilder {
             let mut buf: [u8; 10_000] = [0; 10_000];
             let read_bytes_stdout = stdout.read(&mut buf)?;
             if read_bytes_stdout > 0 {
-                println!(
-                    "read bytes out: {}",
-                    std::str::from_utf8(&buf[..read_bytes_stdout]).unwrap()
-                );
+                match std::str::from_utf8(&buf[..read_bytes_stdout]) {
+                    Ok(output) => {
+                        println!("{}", output);
+                        if response_tx
+                            .try_send(BuildResponse::StdOut(output.to_string()))
+                            .is_err()
+                        {
+                            break;
+                        };
+                    }
+                    Err(error) => log::error!("Bad UTF8 found on stdout {}", error),
+                }
             };
 
             let read_bytes_stderr = stderr.read(&mut buf)?;
             if read_bytes_stderr > 0 {
-                println!(
-                    "read bytes err: {}",
-                    std::str::from_utf8(&buf[..read_bytes_stderr]).unwrap()
-                );
+                match std::str::from_utf8(&buf[..read_bytes_stderr]) {
+                    Ok(output) => {
+                        println!("{}", output);
+                        if response_tx
+                            .try_send(BuildResponse::StdErr(output.to_string()))
+                            .is_err()
+                        {
+                            break;
+                        };
+                    }
+                    Err(error) => log::error!("Bad UTF8 found on stderr {}", error),
+                }
             };
             if read_bytes_stderr == 0 && read_bytes_stdout == 0 {
                 break;
@@ -147,13 +164,13 @@ impl ProgramBuilder {
         }
 
         // Get the hash of the binary
-        let hash = {
+        let (hash, binary) = {
             let binary_filename = get_binary_filename(binary_dir).await?;
             let mut file = File::open(binary_filename).await?;
             let mut contents = vec![];
             file.read_to_end(&mut contents).await?;
             // TODO #6 this wont let us hash chunks which means we need to read the whole binary into memory
-            BlakeTwo256::hash(&contents)
+            (BlakeTwo256::hash(&contents), contents)
         };
         log::info!("Hashed binary {:?}", hash);
 
@@ -161,8 +178,11 @@ impl ProgramBuilder {
         let root_package_metadata_json = serde_json::to_string(&root_package_metadata)?;
         self.0.insert(hash, root_package_metadata_json.as_bytes())?;
 
+        response_tx
+            .try_send(BuildResponse::Success { hash, binary })
+            .unwrap();
         // TODO #7 Make the binary itself available
-        Ok((StatusCode::OK, format!("{:?}", hash)))
+        Ok(())
     }
 }
 /// Get the name of the first .wasm file we find in the target directory

@@ -8,13 +8,12 @@ use axum::{
     Router,
 };
 use cargo_metadata::Package;
-use futures::channel::mpsc as futures_mpsc;
+use futures::channel::mpsc::{self as futures_mpsc, TrySendError};
 use http::Method;
+use serde::{Deserialize, Serialize};
+use sp_core::H256;
 use thiserror::Error;
-use tokio::sync::{
-    mpsc::{channel, Sender},
-    oneshot,
-};
+use tokio::sync::mpsc::{channel, Sender};
 use tower_http::cors::{Any, CorsLayer};
 
 mod build;
@@ -50,10 +49,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/program/:program_hash", get(get_program))
         .route("/add-program-git", post(add_program_git))
         .route("/add-program-tar", post(add_program_tar))
-        .route(
-            "/add-program-git-structured",
-            post(add_program_git_structured),
-        )
         .with_state(AppState {
             db: db.clone(),
             build_requests_tx,
@@ -77,64 +72,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 enum BuildRequest {
     Git {
         url: String,
-        response: oneshot::Sender<Result<(StatusCode, String), AppError>>,
+        response: BuildResponder,
     },
     Tar {
         raw_archive: Vec<u8>,
-        response: oneshot::Sender<Result<(StatusCode, String), AppError>>,
-    },
-    GitStructured {
-        url: String,
-        response: futures_mpsc::Sender<Result<String, AppError>>,
+        response: BuildResponder,
     },
 }
 
-async fn add_program_git_structured(
-    State(state): State<AppState>,
-    git_url: String,
-) -> Result<(StatusCode, Body), AppError> {
-    let (response_tx, response_rx) = futures_mpsc::channel(1000);
-    state
-        .build_requests_tx
-        .send(BuildRequest::GitStructured {
-            url: git_url,
-            response: response_tx,
-        })
-        .await?;
+/// An item in the response stream for a program being built
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum BuildResponse {
+    StdOut(String),
+    StdErr(String),
+    Success { hash: H256, binary: Vec<u8> },
+}
 
-    Ok((StatusCode::OK, Body::from_stream(response_rx)))
+#[derive(Debug, Clone)]
+struct BuildResponder(futures_mpsc::Sender<Result<String, AppError>>);
+
+impl BuildResponder {
+    fn try_send(
+        &mut self,
+        build_response: BuildResponse,
+    ) -> Result<(), TrySendError<Result<String, AppError>>> {
+        self.0
+            .try_send(serde_json::to_string(&build_response).map_err(|e| AppError::Json(e)))
+    }
+
+    fn try_send_error(&mut self, error: AppError) {
+        if self.0.try_send(Err(error)).is_err() {
+            log::error!("Client dropped connection while attempting to send error reponse");
+        }
+    }
 }
 
 /// Add a program from a git repository
 async fn add_program_git(
     State(state): State<AppState>,
     git_url: String,
-) -> Result<(StatusCode, String), AppError> {
-    let (tx, rx) = oneshot::channel();
+) -> Result<(StatusCode, Body), AppError> {
+    let (response_tx, response_rx) = futures_mpsc::channel(1000);
     state
         .build_requests_tx
         .send(BuildRequest::Git {
             url: git_url,
-            response: tx,
+            response: BuildResponder(response_tx),
         })
         .await?;
-    rx.await?
+
+    Ok((StatusCode::OK, Body::from_stream(response_rx)))
 }
 
 /// Add a program given as a tar achive
 async fn add_program_tar(
     State(state): State<AppState>,
     input: Bytes,
-) -> Result<(StatusCode, String), AppError> {
-    let (tx, rx) = oneshot::channel();
+) -> Result<(StatusCode, Body), AppError> {
+    let (response_tx, response_rx) = futures_mpsc::channel(1000);
     state
         .build_requests_tx
         .send(BuildRequest::Tar {
             raw_archive: input.to_vec(),
-            response: tx,
+            response: BuildResponder(response_tx),
         })
         .await?;
-    rx.await?
+    Ok((StatusCode::OK, Body::from_stream(response_rx)))
 }
 
 /// Get metadata about a program with a given hash
