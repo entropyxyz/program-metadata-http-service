@@ -1,35 +1,104 @@
-use axum::http::StatusCode;
 use cargo_metadata::{CargoOpt, MetadataCommand};
+use futures::channel::mpsc::{self as futures_mpsc, TrySendError};
+use serde::{Deserialize, Serialize};
 use sp_core::Hasher;
+use sp_core::H256;
 use sp_runtime::traits::BlakeTwo256;
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 use tar::Archive;
 use temp_dir::TempDir;
+use thiserror::Error;
 use tokio::fs::{read_dir, File};
 use tokio::{io::AsyncReadExt, sync::mpsc::Receiver};
 
-use crate::{AppError, BuildRequest};
+/// A request to build a program
+pub struct BuildRequest {
+    request_type: BuildRequestType,
+    responder: BuildResponder,
+}
+
+impl BuildRequest {
+    /// A new build request with a git url
+    pub fn new_git(url: String, responder: BuildResponder) -> Self {
+        Self {
+            request_type: BuildRequestType::Git { url },
+            responder,
+        }
+    }
+
+    /// A new build request with the contents of a tar archive
+    pub fn new_tar(raw_archive: Vec<u8>, responder: BuildResponder) -> Self {
+        Self {
+            request_type: BuildRequestType::Tar { raw_archive },
+            responder,
+        }
+    }
+}
+
+/// Input parameters for a build request
+pub enum BuildRequestType {
+    Git { url: String },
+    Tar { raw_archive: Vec<u8> },
+}
+
+/// An item in the response stream for a program being built
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BuildResponse {
+    /// A message from building on standard output
+    StdOut(String),
+    /// A message from building on standard error
+    StdErr(String),
+    /// The final message on a successful build, with the hash and binary blob
+    Success {
+        hash: H256,
+        binary: Vec<u8>,
+        binary_filename: String,
+    },
+}
+
+/// For serializing and sending [BuildResponse]s to the client
+#[derive(Debug, Clone)]
+pub struct BuildResponder(pub futures_mpsc::Sender<Result<String, Error>>);
+
+impl BuildResponder {
+    fn try_send(
+        &mut self,
+        build_response: BuildResponse,
+    ) -> Result<(), TrySendError<Result<String, Error>>> {
+        self.0
+            .try_send(serde_json::to_string(&build_response).map_err(|e| Error::Json(e)))
+    }
+
+    fn try_send_error(&mut self, error: Error) {
+        if self.0.try_send(Err(error)).is_err() {
+            log::error!("Client dropped connection while attempting to send error reponse");
+        }
+    }
+}
 
 pub async fn handle_build_requests(mut build_requests_rx: Receiver<BuildRequest>, db: sled::Db) {
     let program_builder = ProgramBuilder(db);
     while let Some(build_request) = build_requests_rx.recv().await {
-        match build_request {
-            BuildRequest::Git { url, response } => {
-                let result = program_builder.add_program_git(url).await;
-                if let Err(_) = response.send(result) {
-                    log::error!("Response channel has been dropped while building a program",);
+        let mut responder = build_request.responder;
+        match build_request.request_type {
+            BuildRequestType::Git { url } => {
+                if let Err(error) = program_builder
+                    .add_program_git(url, responder.clone())
+                    .await
+                {
+                    responder.try_send_error(error)
                 }
             }
-            BuildRequest::Tar {
-                raw_archive,
-                response,
-            } => {
-                let result = program_builder.add_program_tar(raw_archive).await;
-                if let Err(_) = response.send(result) {
-                    log::error!("Response channel has been dropped while building a program",);
+            BuildRequestType::Tar { raw_archive } => {
+                if let Err(error) = program_builder
+                    .add_program_tar(raw_archive, responder.clone())
+                    .await
+                {
+                    responder.try_send_error(error)
                 }
             }
         }
@@ -40,7 +109,11 @@ struct ProgramBuilder(sled::Db);
 
 impl ProgramBuilder {
     /// Add a program given as a location of a git repo
-    pub async fn add_program_git(&self, git_url: String) -> Result<(StatusCode, String), AppError> {
+    pub async fn add_program_git(
+        &self,
+        git_url: String,
+        response_tx: BuildResponder,
+    ) -> Result<(), Error> {
         let temp_dir = TempDir::new()?;
         let output = Command::new("git")
             .arg("clone")
@@ -52,25 +125,33 @@ impl ProgramBuilder {
             .output()?;
 
         if !output.status.success() {
-            return Err(AppError::GitClone(
+            return Err(Error::GitClone(
                 String::from_utf8_lossy(&output.stderr).to_string(),
             ));
         }
 
-        self.add_program(temp_dir.path()).await
+        self.add_program(temp_dir.path(), response_tx).await
     }
 
     /// Add a program given as a tar achive
-    async fn add_program_tar(&self, input: Vec<u8>) -> Result<(StatusCode, String), AppError> {
+    async fn add_program_tar(
+        &self,
+        input: Vec<u8>,
+        response_tx: BuildResponder,
+    ) -> Result<(), Error> {
         let mut archive = Archive::new(&input[..]);
         let temp_dir = TempDir::new()?;
         archive.unpack(temp_dir.path())?;
 
-        self.add_program(temp_dir.path()).await
+        self.add_program(temp_dir.path(), response_tx).await
     }
 
     /// Build a program, and save metadata under the hash of its binary
-    async fn add_program(&self, repo_path: &Path) -> Result<(StatusCode, String), AppError> {
+    async fn add_program(
+        &self,
+        repo_path: &Path,
+        mut response_tx: BuildResponder,
+    ) -> Result<(), Error> {
         let manifest_path: PathBuf = [repo_path, Path::new("Cargo.toml")].iter().collect();
 
         // Get metadata from Cargo.toml file
@@ -81,7 +162,7 @@ impl ProgramBuilder {
 
         let root_package_metadata = metadata
             .root_package()
-            .ok_or(AppError::MetadataMissingRootPackage)?;
+            .ok_or(Error::MetadataMissingRootPackage)?;
 
         // Get the docker image name from Cargo.toml, if there is one
         let docker_image_name =
@@ -97,40 +178,93 @@ impl ProgramBuilder {
                 .arg("--build-arg")
                 .arg(format!("IMAGE={}", image_name));
         }
-        let output = command
+        let mut process = command
             .arg(format!("--output={}", binary_dir.display()))
             .arg(repo_path)
-            .stderr(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .output()?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
 
-        if !output.status.success() {
-            return Err(AppError::CompilationFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+        let mut stdout = process.stdout.take().ok_or(Error::NoStdOut)?;
+        let mut stderr = process.stderr.take().ok_or(Error::NoStdErr)?;
+        loop {
+            let mut buf: [u8; 10_000] = [0; 10_000];
+            let read_bytes_stdout = stdout.read(&mut buf)?;
+            if read_bytes_stdout > 0 {
+                match std::str::from_utf8(&buf[..read_bytes_stdout]) {
+                    Ok(output) => {
+                        println!("{}", output);
+                        if response_tx
+                            .try_send(BuildResponse::StdOut(output.to_string()))
+                            .is_err()
+                        {
+                            break;
+                        };
+                    }
+                    Err(error) => log::error!("Bad UTF8 found on stdout {}", error),
+                }
+            };
+
+            let read_bytes_stderr = stderr.read(&mut buf)?;
+            if read_bytes_stderr > 0 {
+                match std::str::from_utf8(&buf[..read_bytes_stderr]) {
+                    Ok(output) => {
+                        println!("{}", output);
+                        if response_tx
+                            .try_send(BuildResponse::StdErr(output.to_string()))
+                            .is_err()
+                        {
+                            break;
+                        };
+                    }
+                    Err(error) => log::error!("Bad UTF8 found on stderr {}", error),
+                }
+            };
+            if read_bytes_stderr == 0 && read_bytes_stdout == 0 {
+                break;
+            }
+        }
+        if !process.wait()?.success() {
+            return Err(Error::CompilationFailed("Unknown".to_string()));
         }
 
-        // Get the hash of the binary
-        let hash = {
-            let binary_filename = get_binary_filename(binary_dir).await?;
+        let binary_filename = get_binary_filename(binary_dir).await?;
+
+        let binary_filename_string = binary_filename
+            .file_name()
+            .and_then(|o| o.to_str())
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "program.wasm".to_string());
+
+        // Read the wasm binary
+        let binary = {
             let mut file = File::open(binary_filename).await?;
-            let mut contents = vec![];
-            file.read_to_end(&mut contents).await?;
-            // TODO #6 this wont let us hash chunks which means we need to read the whole binary into memory
-            BlakeTwo256::hash(&contents)
+            let mut binary = vec![];
+            file.read_to_end(&mut binary).await?;
+            binary
         };
+
+        // Hash the binary
+        // TODO #6 this wont let us hash chunks which means we need to read the whole binary into memory
+        let hash = BlakeTwo256::hash(&binary);
         log::info!("Hashed binary {:?}", hash);
 
         // Write metadata to db
         let root_package_metadata_json = serde_json::to_string(&root_package_metadata)?;
         self.0.insert(hash, root_package_metadata_json.as_bytes())?;
 
-        // TODO #7 Make the binary itself available
-        Ok((StatusCode::OK, format!("{:?}", hash)))
+        response_tx
+            .try_send(BuildResponse::Success {
+                hash,
+                binary,
+                binary_filename: binary_filename_string,
+            })
+            .map_err(|_| Error::Mpsc)?;
+        Ok(())
     }
 }
 /// Get the name of the first .wasm file we find in the target directory
-async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, AppError> {
+async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, Error> {
     let mut dir_contents = read_dir(binary_dir).await?;
     while let Some(entry) = dir_contents.next_entry().await? {
         if let Some(extension) = entry.path().extension() {
@@ -139,7 +273,7 @@ async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, AppError> {
             }
         }
     }
-    Err(AppError::CompilationFailed(
+    Err(Error::CompilationFailed(
         "Cannot find binary after compiling".to_string(),
     ))
 }
@@ -159,4 +293,31 @@ fn get_docker_image_name_from_metadata(metadata: &serde_json::value::Value) -> O
         }
     }
     None
+}
+
+/// An error when trying to build a program
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Could not clone git repository: {0}")]
+    GitClone(String),
+    #[error("Cannot find root package in Cargo.toml")]
+    MetadataMissingRootPackage,
+    #[error("Error reading Cargo.toml: {0}")]
+    Metadata(#[from] cargo_metadata::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Database error {0}")]
+    Db(#[from] sled::Error),
+    #[error("Cannot decode hex {0}")]
+    Hex(#[from] hex::FromHexError),
+    #[error("Io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Compilation failed: {0}")]
+    CompilationFailed(String),
+    #[error("Failed to get standard output of child process")]
+    NoStdOut,
+    #[error("Failed to get standard error of child process")]
+    NoStdErr,
+    #[error("Could not send response - client disconnected")]
+    Mpsc,
 }

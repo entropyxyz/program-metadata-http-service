@@ -1,6 +1,6 @@
 //! An http service which builds programs and hosts related metadata
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{self, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
@@ -8,16 +8,13 @@ use axum::{
     Router,
 };
 use cargo_metadata::Package;
+use futures::channel::mpsc::{self as futures_mpsc};
 use http::Method;
 use thiserror::Error;
-use tokio::sync::{
-    mpsc::{channel, Sender},
-    oneshot,
-};
+use tokio::sync::mpsc::{channel, Sender};
 use tower_http::cors::{Any, CorsLayer};
 
-mod build;
-use build::handle_build_requests;
+use program_metadata_http_service::build::{handle_build_requests, BuildRequest, BuildResponder};
 
 #[derive(Clone)]
 struct AppState {
@@ -68,48 +65,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// A request to build a program
-enum BuildRequest {
-    Git {
-        url: String,
-        response: oneshot::Sender<Result<(StatusCode, String), AppError>>,
-    },
-    Tar {
-        raw_archive: Vec<u8>,
-        response: oneshot::Sender<Result<(StatusCode, String), AppError>>,
-    },
-}
-
 /// Add a program from a git repository
 async fn add_program_git(
     State(state): State<AppState>,
     git_url: String,
-) -> Result<(StatusCode, String), AppError> {
-    let (tx, rx) = oneshot::channel();
+) -> Result<(StatusCode, Body), AppError> {
+    let (response_tx, response_rx) = futures_mpsc::channel(1000);
     state
         .build_requests_tx
-        .send(BuildRequest::Git {
-            url: git_url,
-            response: tx,
-        })
+        .send(BuildRequest::new_git(git_url, BuildResponder(response_tx)))
         .await?;
-    rx.await?
+
+    Ok((StatusCode::OK, Body::from_stream(response_rx)))
 }
 
 /// Add a program given as a tar achive
 async fn add_program_tar(
     State(state): State<AppState>,
     input: Bytes,
-) -> Result<(StatusCode, String), AppError> {
-    let (tx, rx) = oneshot::channel();
+) -> Result<(StatusCode, Body), AppError> {
+    let (response_tx, response_rx) = futures_mpsc::channel(1000);
     state
         .build_requests_tx
-        .send(BuildRequest::Tar {
-            raw_archive: input.to_vec(),
-            response: tx,
-        })
+        .send(BuildRequest::new_tar(
+            input.to_vec(),
+            BuildResponder(response_tx),
+        ))
         .await?;
-    rx.await?
+    Ok((StatusCode::OK, Body::from_stream(response_rx)))
 }
 
 /// Get metadata about a program with a given hash
@@ -162,13 +145,7 @@ async fn front_page(State(state): State<AppState>) -> Html<String> {
 }
 
 #[derive(Debug, Error)]
-enum AppError {
-    #[error("Could not clone git repository: {0}")]
-    GitClone(String),
-    #[error("Cannot find root package in Cargo.toml")]
-    MetadataMissingRootPackage,
-    #[error("Error reading Cargo.toml: {0}")]
-    Metadata(#[from] cargo_metadata::Error),
+pub enum AppError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Utf8Error: {0}")]
@@ -177,16 +154,10 @@ enum AppError {
     Db(#[from] sled::Error),
     #[error("Cannot decode hex {0}")]
     Hex(#[from] hex::FromHexError),
-    #[error("Io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Compilation failed: {0}")]
-    CompilationFailed(String),
     #[error("Program not found")]
     ProgramNotFound,
     #[error("Queue is full: {0}")]
     MpscSend(#[from] tokio::sync::mpsc::error::SendError<BuildRequest>),
-    #[error("Response channel sender dropped: {0}")]
-    OneShotRecv(#[from] tokio::sync::oneshot::error::RecvError),
 }
 
 impl IntoResponse for AppError {
