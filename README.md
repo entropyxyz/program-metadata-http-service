@@ -131,6 +131,14 @@ Example reponse:
 }
 ```
 
+## Example client
+
+There is also a simple command-line client given as an example. For usage information run:
+
+```bash
+cargo run --example client help
+```
+
 ## Running the server
 
 ### Requirements:
