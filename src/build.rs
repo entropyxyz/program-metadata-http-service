@@ -165,15 +165,14 @@ impl ProgramBuilder {
             .ok_or(Error::MetadataMissingRootPackage)?;
 
         // Get the docker image name from Cargo.toml, if there is one
-        let docker_image_name =
-            get_docker_image_name_from_metadata(&root_package_metadata.metadata);
+        let entropy_metadata = extract_metadata(&root_package_metadata.metadata);
 
         let binary_dir: PathBuf = [repo_path, Path::new("binary_dir")].iter().collect();
 
         // Build the program
         let mut command = Command::new("docker");
         command.arg("build");
-        if let Some(image_name) = docker_image_name {
+        if let Some(image_name) = entropy_metadata.docker_image.clone() {
             command
                 .arg("--build-arg")
                 .arg(format!("IMAGE={}", image_name));
@@ -244,9 +243,12 @@ impl ProgramBuilder {
             binary
         };
 
-        // Hash the binary
+        // Hash the binary with metadata
+        let mut hash_input: Vec<u8> = vec![];
+        hash_input.extend(&binary);
+        hash_input.extend(&entropy_metadata.to_bytes());
         // TODO #6 this wont let us hash chunks which means we need to read the whole binary into memory
-        let hash = BlakeTwo256::hash(&binary);
+        let hash = BlakeTwo256::hash(&hash_input);
         log::info!("Hashed binary {:?}", hash);
 
         // Write metadata to db
@@ -278,21 +280,64 @@ async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, Error> {
     ))
 }
 
+#[derive(Default)]
+struct EntropyProgramMetadata {
+    docker_image: Option<String>,
+    configuration_schema: Option<String>,
+    auxiliary_data_schema: Option<String>,
+    oracle_data_pointer: Option<String>,
+    version_number: Option<u8>,
+}
+
+impl EntropyProgramMetadata {
+    fn to_bytes(self) -> Vec<u8> {
+        let mut bytes: Vec<u8> = vec![];
+        bytes.extend(self.configuration_schema.unwrap_or_default().as_bytes());
+        bytes.extend(self.auxiliary_data_schema.unwrap_or_default().as_bytes());
+        bytes.extend(self.oracle_data_pointer.unwrap_or_default().as_bytes());
+        bytes.extend(&vec![self.version_number.unwrap_or_default()]);
+        bytes
+    }
+}
+
 /// We expect there to be a docker image given in the Cargo.toml file like so:
 /// ```toml
 /// [package.metadata.entropy-program]
 /// docker-image = "peg997/build-entropy-programs:version0.1"
 /// ```
 /// If this is not present a default image is used
-fn get_docker_image_name_from_metadata(metadata: &serde_json::value::Value) -> Option<String> {
+fn extract_metadata(metadata: &serde_json::value::Value) -> EntropyProgramMetadata {
+    let mut entropy_metadata = EntropyProgramMetadata::default();
     if let serde_json::value::Value::Object(m) = metadata {
         if let Some(serde_json::value::Value::Object(p)) = m.get("entropy-program") {
-            if let Some(serde_json::value::Value::String(image_name)) = p.get("docker-image") {
-                return Some(image_name.clone());
-            }
+            if let Some(serde_json::value::Value::String(docker_image)) = p.get("docker-image") {
+                entropy_metadata.docker_image = Some(docker_image.clone());
+            };
+            if let Some(serde_json::value::Value::String(configuration_schema)) =
+                p.get("configuration-schema")
+            {
+                entropy_metadata.configuration_schema = Some(configuration_schema.clone());
+            };
+            if let Some(serde_json::value::Value::String(auxiliary_data_schema)) =
+                p.get("auxiliary-data-schema")
+            {
+                entropy_metadata.auxiliary_data_schema = Some(auxiliary_data_schema.clone());
+            };
+            if let Some(serde_json::value::Value::String(oracle_data_pointer)) =
+                p.get("oracle-data-pointer")
+            {
+                entropy_metadata.oracle_data_pointer = Some(oracle_data_pointer.clone());
+            };
+            if let Some(serde_json::value::Value::Number(version_number)) = p.get("version-number")
+            {
+                entropy_metadata.version_number = version_number
+                    .as_u64()
+                    .map(|v| v.try_into().ok())
+                    .unwrap_or(None);
+            };
         }
     }
-    None
+    entropy_metadata
 }
 
 /// An error when trying to build a program
