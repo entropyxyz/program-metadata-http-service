@@ -13,8 +13,8 @@ tar = "0.4.40"
 thiserror = "1.0.56"
 tokio = { version = "1.36.0", features = ["rt-multi-thread"] }
 tower-http = { version = "0.5.1", features = ["fs", "cors"] }
-sp-runtime = { version = "24.0.0", default-features = true }
-sp-core = "21.0.0"
+sp-runtime = "32.0.0"
+sp-core = "31.0.0"
 cargo_metadata = "0.18.1"
 sled = "0.34.7"
 hex = "0.4.3"
