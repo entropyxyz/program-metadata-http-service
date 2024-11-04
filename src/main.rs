@@ -16,6 +16,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use program_metadata_http_service::build::{handle_build_requests, BuildRequest, BuildResponder};
 
+/// State available to http route handlers
 #[derive(Clone)]
 struct AppState {
     /// The key value store

@@ -15,6 +15,8 @@ use thiserror::Error;
 use tokio::fs::{read_dir, File};
 use tokio::{io::AsyncReadExt, sync::mpsc::Receiver};
 
+const OUTPUT_BUFFER_SIZE: usize = 10_000;
+
 /// A request to build a program
 pub struct BuildRequest {
     request_type: BuildRequestType,
@@ -65,6 +67,7 @@ pub enum BuildResponse {
 pub struct BuildResponder(pub futures_mpsc::Sender<Result<String, Error>>);
 
 impl BuildResponder {
+    /// Attempt to serialize and send a [BuildResponse] to the client
     fn try_send(
         &mut self,
         build_response: BuildResponse,
@@ -73,6 +76,7 @@ impl BuildResponder {
             .try_send(serde_json::to_string(&build_response).map_err(|e| Error::Json(e)))
     }
 
+    /// Attempt to serialize and send an [Error] to the client
     fn try_send_error(&mut self, error: Error) {
         if self.0.try_send(Err(error)).is_err() {
             log::error!("Client dropped connection while attempting to send error reponse");
@@ -80,6 +84,7 @@ impl BuildResponder {
     }
 }
 
+/// Handle incoming requests to build a program from the client
 pub async fn handle_build_requests(mut build_requests_rx: Receiver<BuildRequest>, db: sled::Db) {
     let program_builder = ProgramBuilder(db);
     while let Some(build_request) = build_requests_rx.recv().await {
@@ -105,6 +110,7 @@ pub async fn handle_build_requests(mut build_requests_rx: Receiver<BuildRequest>
     }
 }
 
+/// Builds programs and stores metadata
 struct ProgramBuilder(sled::Db);
 
 impl ProgramBuilder {
@@ -186,8 +192,8 @@ impl ProgramBuilder {
 
         let mut stdout = process.stdout.take().ok_or(Error::NoStdOut)?;
         let mut stderr = process.stderr.take().ok_or(Error::NoStdErr)?;
+        let mut buf: [u8; OUTPUT_BUFFER_SIZE] = [0; OUTPUT_BUFFER_SIZE];
         loop {
-            let mut buf: [u8; 10_000] = [0; 10_000];
             let read_bytes_stdout = stdout.read(&mut buf)?;
             if read_bytes_stdout > 0 {
                 match std::str::from_utf8(&buf[..read_bytes_stdout]) {
@@ -265,6 +271,7 @@ impl ProgramBuilder {
         Ok(())
     }
 }
+
 /// Get the name of the first .wasm file we find in the target directory
 async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, Error> {
     let mut dir_contents = read_dir(binary_dir).await?;
@@ -280,16 +287,24 @@ async fn get_binary_filename(binary_dir: PathBuf) -> Result<PathBuf, Error> {
     ))
 }
 
+/// Metadata extracted from the `Cargo.toml` file which is specific to Entropy programs
 #[derive(Default)]
 struct EntropyProgramMetadata {
+    /// The name of the docker image used to build the program
     docker_image: Option<String>,
+    /// Configuration schema (typically given as JSON schema)
     configuration_schema: Option<String>,
+    /// auxiliary_data_schema (typically given as JSON schema)
     auxiliary_data_schema: Option<String>,
+    /// Oracle data pointer
     oracle_data_pointer: Option<String>,
+    /// Program version number
     version_number: Option<u8>,
 }
 
 impl EntropyProgramMetadata {
+    /// Get all the values which are used in the on-chain program hash in the same format they are
+    /// added to the hash in the programs pallet
     fn to_bytes(self) -> Vec<u8> {
         let mut bytes: Vec<u8> = vec![];
         bytes.extend(self.configuration_schema.unwrap_or_default().as_bytes());
@@ -300,12 +315,11 @@ impl EntropyProgramMetadata {
     }
 }
 
-/// We expect there to be a docker image given in the Cargo.toml file like so:
+/// We expect there to be program-related metadata given in the Cargo.toml file like so:
 /// ```toml
 /// [package.metadata.entropy-program]
 /// docker-image = "peg997/build-entropy-programs:version0.1"
 /// ```
-/// If this is not present a default image is used
 fn extract_metadata(metadata: &serde_json::value::Value) -> EntropyProgramMetadata {
     let mut entropy_metadata = EntropyProgramMetadata::default();
     if let serde_json::value::Value::Object(m) = metadata {
