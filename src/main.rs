@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (build_requests_tx, build_requests_rx) = channel(1000);
 
-    let db = sled::open("./db")?;
+    let db = sled::open("./program-metadata-http-service-db")?;
 
     let app = Router::new()
         .route("/", get(front_page))

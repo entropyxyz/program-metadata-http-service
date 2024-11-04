@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 binary,
                                 binary_filename,
                             } => {
-                                println!("Success {:?}", hash);
+                                println!("Success! Program hash is {:?}", hash);
                                 let mut file = File::create(&binary_filename)?;
                                 file.write_all(&binary)?;
                                 println!("Writen {} bytes to {}", binary.len(), binary_filename);
