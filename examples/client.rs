@@ -1,3 +1,4 @@
+//! A simple CLI HTTP client for the program-metadata-http-service
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use program_metadata_http_service::build::BuildResponse;
